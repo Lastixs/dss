@@ -2324,7 +2324,7 @@ async def on_ready():
 
 # -------------- RUN --------------
 if __name__ == "__main__":
-    TOKEN = os.getenv("")
+    TOKEN = os.getenv("MTMzOTQ4OTA4NTk3MDE4NjMxMg.GUTvBK.-BiuQZUFqc-iH3TeSL_IPkNC0uQ9GQEju9UCl0") or "MTMzOTQ4OTA4NTk3MDE4NjMxMg.GUTvBK.-BiuQZUFqc-iH3TeSL_IPkNC0uQ9GQEju9UCl0"
     if TOKEN == "PASTE_YOUR_TOKEN_HERE":
         print("⚠️  Вставь токен в переменную TOKEN или DISCORD_TOKEN env!")
     bot.run(TOKEN)
