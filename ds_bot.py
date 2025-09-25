@@ -2301,30 +2301,19 @@ async def clear_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ У вас нет доступа к этой команде.", ephemeral=True)
 
 
-# -------------- STARTUP & PERSISTENT VIEW --------------
 @bot.event
 async def on_ready():
     logging.info("✅ Бот %s запущен!", bot.user)
     activity = discord.Game(name="играет пальчиком в очке Дойза | /help ❤")
     await bot.change_presence(status=discord.Status.online, activity=activity)
-    try:
-        # регистрируем persistent view по custom_id (без привязки к guild_id)
-        bot.add_view(MusicControlView())
-    except Exception as e:
-        logging.error("add_view error: %s", e)
 
-    # синхронизация команд
     try:
-        synced = await tree.sync()
-        names = ", ".join(sorted([c.name for c in synced]))
-        logging.info("🔄 Синхронизировано %d глобальных команд: %s", len(synced), names)
+        synced = await bot.tree.sync()
+        logging.info("🔄 Синхронизировано %d глобальных команд", len(synced))
     except Exception as e:
         logging.error("Ошибка sync: %s", e)
 
+# ← сюда вставь НОВЫЙ бот-токен из Discord Developer Portal
+TOKEN = "MTMzOTQ4OTA4NTk3MDE4NjMxMg.GkuFvo.V4UaQADXE4pjm9_HSoPlP2fsEeLF7p099-IV0E"
 
-# -------------- RUN --------------
-if __name__ == "__main__":
-    TOKEN = os.getenv("MTMzOTQ4OTA4NTk3MDE4NjMxMg.GUTvBK.-BiuQZUFqc-iH3TeSL_IPkNC0uQ9GQEju9UCl0") or "MTMzOTQ4OTA4NTk3MDE4NjMxMg.GUTvBK.-BiuQZUFqc-iH3TeSL_IPkNC0uQ9GQEju9UCl0"
-    if TOKEN == "PASTE_YOUR_TOKEN_HERE":
-        print("⚠️  Вставь токен в переменную TOKEN или DISCORD_TOKEN env!")
-    bot.run(TOKEN)
+bot.run(TOKEN)
