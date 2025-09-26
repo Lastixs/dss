@@ -604,452 +604,291 @@ async def заявки_error(interaction: discord.Interaction, error):
         else:
             await interaction.response.send_message("❌ У вас нет доступа к этой команде.", ephemeral=True)
 
-# -------------- ГЛОБАЛЬНОЕ ХРАНИЛИЩЕ ----------------
-music_players: dict[int, "MusicPlayer"] = {}  # guild_id -> MusicPlayer
 
-# -------------- НАСТРОЙКИ АВТОДОПОЛНЕНИЯ --------------
-USE_DEEZER = True        # False => использовать iTunes
+import os, re, shlex, asyncio, logging, copy
+from typing import Optional, List, Tuple, Dict, Any
+
+import aiohttp
+import discord
+from discord import app_commands, Interaction
+from discord.ext import commands
+from discord.ui import View, Button
+from discord import ButtonStyle
+import yt_dlp
+
+# ============================ НАСТРОЙКИ ============================
+FFMPEG_BIN = "/usr/bin/ffmpeg"        # системный ffmpeg
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+)
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+# yt-dlp базовые опции (YouTube-first, webm/opus в приоритете)
+YTDLP_BASE = {
+    "format": "bestaudio[ext=webm][acodec=opus]/bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "source_address": "0.0.0.0",  # IPv4
+    "extract_flat": False,
+    "default_search": "ytsearch",
+    "extractor_args": {"youtube": {"player_client": ["android", "android_music", "web_safari"]}},
+    "http_headers": {"User-Agent": DEFAULT_UA},
+}
+
+# автодополнение
 AUTOCOMPLETE_TIMEOUT = 1.5
-SUGG_TTL = 120  # сек, кэш подсказок
+SUGG_TTL = 120  # сек
+_USE_DEEZER = False  # True — deezer в приоритете; False — iTunes
 
-_SUGG_CACHE: dict[str, tuple[float, List[app_commands.Choice[str]]]] = {}
+# ============================ УТИЛИТЫ ============================
+def is_url(s: str) -> bool:
+    return bool(re.match(r"^https?://", s or "", re.I))
 
+async def ytdlp_extract(q: str, opts: Optional[dict] = None, timeout: float = 12.0) -> Optional[Dict[str, Any]]:
+    """Запуск yt-dlp в отдельном потоке с таймаутом."""
+    loop = asyncio.get_running_loop()
+    merged = copy.deepcopy(YTDLP_BASE)
+    if opts:
+        # мягко обновляем, чтобы базовые ключи оставались
+        for k, v in opts.items():
+            merged[k] = v
+
+    def _run():
+        with yt_dlp.YoutubeDL(merged) as ydl:
+            return ydl.extract_info(q, download=False)
+
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=timeout)
+    except Exception as e:
+        logging.warning("yt-dlp error for %r: %s", q, e)
+        return None
+
+def headers_to_crlf(headers: Dict[str, str]) -> str:
+    return "".join(f"{k}: {v}\r\n" for k, v in headers.items() if v)
+
+def build_ffmpeg_kwargs(headers: Dict[str, str]) -> dict:
+    h = dict(headers or {})
+    h.setdefault("User-Agent", DEFAULT_UA)
+    h.setdefault("Accept", "*/*")
+    hdr = headers_to_crlf(h)
+    before = (
+        "-nostdin "
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
+        "-reconnect_at_eof 1 -reconnect_delay_max 5 "
+        f"-headers {shlex.quote(hdr)} "
+        "-protocol_whitelist file,crypto,http,https,tcp,tls "
+        "-rw_timeout 20000000 "            # 20s (микросекунды)
+        "-fflags +nobuffer -flags low_delay "
+        "-probesize 64k -analyzeduration 0 "
+    )
+    return {
+        "before_options": before,
+        "options": "-vn -sn -ar 48000 -ac 2 -loglevel error",
+        "executable": FFMPEG_BIN,
+    }
+
+# ============================ АВТОДОПОЛНЕНИЕ ============================
+_SUGG_CACHE: Dict[str, Tuple[float, List[app_commands.Choice[str]]]] = {}
 
 def _cache_get(q: str) -> Optional[List[app_commands.Choice[str]]]:
-    item = _SUGG_CACHE.get(q.lower())
+    key = q.lower()
+    item = _SUGG_CACHE.get(key)
     if not item:
         return None
     ts, data = item
-    if time.time() - ts > SUGG_TTL:
+    if (asyncio.get_event_loop().time() - ts) > SUGG_TTL:
         return None
     return data
 
-
 def _cache_put(q: str, data: List[app_commands.Choice[str]]) -> None:
-    _SUGG_CACHE[q.lower()] = (time.time(), data)
-
-
-async def deezer_autocomplete(q: str) -> List[app_commands.Choice[str]]:
-    q = (q or '').strip()
-    if len(q) < 2:
-        return []
-    cached = _cache_get(q)
-    if cached is not None:
-        return cached
-
-    url = "https://api.deezer.com/search"
-    params = {"q": q, "limit": 5}
-    timeout = aiohttp.ClientTimeout(total=AUTOCOMPLETE_TIMEOUT)
-    out: List[app_commands.Choice[str]] = []
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params) as r:
-                if r.status != 200:
-                    _cache_put(q, [])
-                    return []
-                data = await r.json()
-                for item in (data.get("data") or [])[:5]:
-                    title = (item.get("title") or "Без названия").strip()
-                    artist = (item.get("artist", {}).get("name") or "").strip()
-                    display = (f"{title} — {artist}" if artist else title)[:100]
-                    # value — текст, который точно найдётся в ytsearch
-                    value = f"{title} {artist} audio"
-                    out.append(app_commands.Choice(name=display, value=value))
-    except Exception:
-        pass
-
-    _cache_put(q, out)
-    return out
-
-
-async def itunes_autocomplete(q: str) -> List[app_commands.Choice[str]]:
-    q = (q or '').strip()
-    if len(q) < 2:
-        return []
-    cached = _cache_get(q)
-    if cached is not None:
-        return cached
-
-    url = "https://itunes.apple.com/search"
-    params = {"term": q, "entity": "song", "limit": 5, "lang": "ru_RU"}
-    timeout = aiohttp.ClientTimeout(total=AUTOCOMPLETE_TIMEOUT)
-    out: List[app_commands.Choice[str]] = []
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params) as r:
-                if r.status != 200:
-                    _cache_put(q, [])
-                    return []
-                data = await r.json()
-                for item in (data.get("results") or [])[:5]:
-                    title = (item.get("trackName") or "Без названия").strip()
-                    artist = (item.get("artistName") or "").strip()
-                    display = (f"{title} — {artist}" if artist else title)[:100]
-                    value = f"{title} {artist} audio"
-                    out.append(app_commands.Choice(name=display, value=value))
-    except Exception:
-        pass
-
-    _cache_put(q, out)
-    return out
-
-
-_YT_URL_RE = re.compile(r"https?://(www\.)?(youtube\.com|youtu\.be)/", re.I)
-
-def _is_url(s: str) -> bool:
-    return bool(_YT_URL_RE.search(s))
-
-async def extract_info_async(query: str, ytdlp_opts: dict, timeout: float = 7.0):
-    loop = asyncio.get_running_loop()
-
-    def run_yt(q: str):
-        try:
-            with yt_dlp.YoutubeDL(ytdlp_opts) as ydl:
-                return ydl.extract_info(q, download=False)
-        except Exception:
-            return None
-
-    async def call(q: str):
-        try:
-            return await asyncio.wait_for(loop.run_in_executor(None, run_yt, q), timeout=timeout)
-        except Exception:
-            return None
-
-    return await call(query)
-
-# Базовые опции (с обходом SABR)
-YTDLP_BASE = {
-    'format': 'bestaudio[ext=webm]/bestaudio/best',
-    'noplaylist': True,
-    'quiet': True,
-    'geo_bypass': True,
-    'source_address': '0.0.0.0',  # IPv4
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'android_music', 'web_safari']
-        }
-    },
-    'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) '
-                      'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 '
-                      'Mobile/15E148 Safari/604.1'
-    },
-}
-
-_YT_CLIENTS = ['android', 'android_music', 'web_safari']
-
-
-async def ytdlp_resolve_track(query: str, *, timeout: float = 9.0) -> Optional[Tuple[str, str, Optional[str], Optional[str]]]:
-    """
-    Возвращает (title, stream_url, thumbnail, page_url) или None.
-    Перебирает разные youtube player_client и формы запроса, чтобы надёжно достать поток.
-    """
-    is_url = _is_url(query) or query.startswith("http://") or query.startswith("https://")
-    search_forms = [query] if is_url else [f"ytsearch1:{query}", query]
-
-    for form in search_forms:
-        for client in _YT_CLIENTS:
-            opts = copy.deepcopy(YTDLP_BASE)
-            opts.setdefault('extractor_args', {}).setdefault('youtube', {})['player_client'] = [client]
-
-            info = await extract_info_async(form, opts, timeout=timeout)
-            if not info:
-                continue
-            if 'entries' in info:
-                entries = info.get('entries') or []
-                if not entries:
-                    continue
-                info = entries[0]
-
-            stream_url = info.get('url')
-            title = info.get('title') or 'Без названия'
-            thumb = info.get('thumbnail')
-            page_url = info.get('webpage_url') or (query if is_url else None)
-
-            # Если пришёл «плоский» ответ — повторим по странице
-            if not stream_url and page_url:
-                info2 = await extract_info_async(page_url, opts, timeout=timeout)
-                if info2 and 'entries' in info2:
-                    ents = info2.get('entries') or []
-                    info2 = ents[0] if ents else None
-                if info2:
-                    stream_url = info2.get('url') or stream_url
-                    title = info2.get('title') or title
-                    thumb = info2.get('thumbnail') or thumb
-
-            if stream_url:
-                return (title, stream_url, thumb, page_url)
-
-    return None
-
-
-# === НАСТРОЙКИ АВТОДОПОЛНЕНИЯ ===
-USE_DEEZER = False              # True — использовать Deezer, False — iTunes
-USE_YOUTUBE_FALLBACK = True     # если провайдер ничего не нашёл — добивать ytsearch
-
-# === yt-dlp для поиска и стримов ===
-import yt_dlp
-from functools import partial
-
-YTDLP_BASE_OPTS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "source_address": "0.0.0.0",
-    "extract_flat": False,
-    "default_search": "ytsearch",
-}
-
-# Глобалка под игроков гильдий
-music_players: dict[int, "MusicPlayer"] = {}
-
-# -------------------------------------------------------
-# УТИЛИТЫ
-# -------------------------------------------------------
-
-_url_rx = re.compile(r"^https?://", re.I)
-
-def _is_url(s: str) -> bool:
-    return bool(_url_rx.match(s or ""))
-
-
-async def extract_info_async(query: str, opts: dict | None = None, timeout: float = 10.0):
-    """
-    Безопасно дергаем yt-dlp в треде.
-    Возвращает словарь info или None.
-    """
-    loop = asyncio.get_running_loop()
-    ytdlp_opts = (opts or YTDLP_BASE_OPTS) | {"default_search": (opts or {}).get("default_search", "ytsearch")}
-    func = partial(_ytdlp_extract, query, ytdlp_opts)
-    try:
-        return await asyncio.wait_for(loop.run_in_executor(None, func), timeout=timeout)
-    except Exception as e:
-        logging.warning("yt-dlp extract timeout/err for %r: %s", query, e)
-        return None
-
-
-def _ytdlp_extract(query: str, opts: dict):
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(query, download=False)
-
-
-# -------------------------------------------------------
-# ЛЁГКИЕ ПРОВАЙДЕРЫ АВТОДОПОЛНЕНИЯ (iTunes / Deezer)
-# -------------------------------------------------------
-# Мы используем публичные REST-и без ключей. Быстро, дешево и сердито.
-# iTunes: https://itunes.apple.com/search?term=...&entity=song&limit=...
-# Deezer: https://api.deezer.com/search?q=...&limit=...
-
-import aiohttp
-
+    _SUGG_CACHE[q.lower()] = (asyncio.get_event_loop().time(), data)
 
 async def itunes_autocomplete(current: str) -> List[app_commands.Choice[str]]:
-    if not current.strip():
+    q = (current or "").strip()
+    if len(q) < 2:
         return []
+    cached = _cache_get(q)
+    if cached is not None:
+        return cached
+
     url = "https://itunes.apple.com/search"
-    params = {
-        "term": current,
-        "entity": "song",
-        "limit": 10,
-        "country": "US",
-    }
+    params = {"term": q, "entity": "song", "limit": 10, "country": "US"}
+    timeout = aiohttp.ClientTimeout(total=AUTOCOMPLETE_TIMEOUT)
+    out: List[app_commands.Choice[str]] = []
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=5) as resp:
-                data = await resp.json()
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params=params) as r:
+                if r.status != 200:
+                    _cache_put(q, [])
+                    return []
+                data = await r.json()
+                for item in data.get("results", [])[:10]:
+                    title = (item.get("trackName") or item.get("collectionName") or "Без названия").strip()
+                    artist = (item.get("artistName") or "").strip()
+                    label = f"{title} — {artist}" if artist else title
+                    # value — строка для ytsearch
+                    out.append(app_commands.Choice(name=label[:100], value=f"{title} {artist} audio"))
     except Exception:
-        return []
+        pass
 
-    choices: List[app_commands.Choice[str]] = []
-    for item in data.get("results", []):
-        name = item.get("trackName") or item.get("collectionName")
-        artist = item.get("artistName") or ""
-        page = item.get("trackViewUrl") or item.get("collectionViewUrl")
-        if not name or not page:
-            continue
-        label = f"{name} — {artist}"[:100]
-        # value отдаём page_url — так /play сможет качнуть точный стрим
-        choices.append(app_commands.Choice(name=label, value=page))
-    return choices
-
+    _cache_put(q, out)
+    return out
 
 async def deezer_autocomplete(current: str) -> List[app_commands.Choice[str]]:
-    if not current.strip():
+    q = (current or "").strip()
+    if len(q) < 2:
         return []
+    cached = _cache_get(q)
+    if cached is not None:
+        return cached
+
     url = "https://api.deezer.com/search"
-    params = {"q": current, "limit": 10}
+    params = {"q": q, "limit": 10}
+    timeout = aiohttp.ClientTimeout(total=AUTOCOMPLETE_TIMEOUT)
+    out: List[app_commands.Choice[str]] = []
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=5) as resp:
-                data = await resp.json()
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params=params) as r:
+                if r.status != 200:
+                    _cache_put(q, [])
+                    return []
+                data = await r.json()
+                for item in (data.get("data") or [])[:10]:
+                    title = (item.get("title") or "Без названия").strip()
+                    artist = ((item.get("artist") or {}).get("name") or "").strip()
+                    label = f"{title} — {artist}" if artist else title
+                    out.append(app_commands.Choice(name=label[:100], value=f"{title} {artist} audio"))
     except Exception:
+        pass
+
+    _cache_put(q, out)
+    return out
+
+async def yt_autocomplete(current: str) -> List[app_commands.Choice[str]]:
+    q = (current or "").strip()
+    if len(q) < 2:
         return []
-
-    choices: List[app_commands.Choice[str]] = []
-    for item in data.get("data", []):
-        title = item.get("title")
-        artist = (item.get("artist") or {}).get("name") or ""
-        link = item.get("link")  # deezer трек-страница (page_url)
-        if not title or not link:
-            continue
-        label = f"{title} — {artist}"[:100]
-        choices.append(app_commands.Choice(name=label, value=link))
-    return choices
-
-
-async def youtube_autocomplete(current: str) -> List[app_commands.Choice[str]]:
-    """Запасной план — быстрый ytsearch через yt-dlp (без API-ключей)."""
-    if not current.strip():
-        return []
-    # плоский поиск без лишних полей — ускоряем
-    info = await extract_info_async(f"ytsearch10:{current}", YTDLP_BASE_OPTS | {"extract_flat": True}, timeout=7.0)
+    info = await ytdlp_extract(f"ytsearch10:{q}", {"extract_flat": True}, timeout=7.0)
     if not info or "entries" not in info:
         return []
-    choices: List[app_commands.Choice[str]] = []
+    out: List[app_commands.Choice[str]] = []
     for e in (info.get("entries") or []):
         title = e.get("title") or "Unknown"
         url = e.get("url") or e.get("webpage_url")
         if not url:
             continue
-        label = title[:100]
-        # значение — прямая страница YouTube
-        choices.append(app_commands.Choice(name=label, value=url))
-    return choices
-
+        out.append(app_commands.Choice(name=title[:100], value=url))
+    return out
 
 async def smart_autocomplete(current: str) -> List[app_commands.Choice[str]]:
-    """Агрегатор: провайдер -> fallback -> объединение (без дублей)."""
-    primary = await (deezer_autocomplete(current) if USE_DEEZER else itunes_autocomplete(current))
+    primary = await (deezer_autocomplete(current) if _USE_DEEZER else itunes_autocomplete(current))
     if primary:
         return primary
-    if USE_YOUTUBE_FALLBACK:
-        return await youtube_autocomplete(current)
-    return []
+    return await yt_autocomplete(current)
 
-
-# -------------------------------------------------------
-# MUSIC PLAYER
-# -------------------------------------------------------
+# ============================ ПЛЕЕР ============================
+Track = Tuple[str, str, Optional[str], Optional[str], Dict[str, str]]  # title, stream, thumb, page, http_headers
 
 class MusicPlayer:
     """На сервер — один экземпляр."""
-    def __init__(self, guild: discord.Guild, vc: discord.VoiceClient, text_channel: discord.abc.Messageable, bot: discord.Client):
+    def __init__(self, guild: discord.Guild, vc: discord.VoiceClient,
+                 text_channel: discord.abc.Messageable, bot: discord.Client):
         self.guild = guild
         self.vc = vc
         self.text_channel = text_channel
         self.bot = bot
-        self.volume = 0.5
-        self.current_source: Optional[discord.PCMVolumeTransformer] = None
-        # очередь: (title, stream_url, thumb, page_url)
-        self.queue: List[Tuple[str, str, Optional[str], Optional[str]]] = []
-        self.current_track: Optional[Tuple[str, str, Optional[str], Optional[str]]] = None
+        self.volume = 0.75
+        self.queue: List[Track] = []
+        self.current: Optional[Track] = None
+        self.current_source: Optional[discord.AudioSource] = None
+        self._lock = asyncio.Lock()
+        self._leave_guard = False
         self.control_message: Optional[discord.Message] = None
-        self._play_lock = asyncio.Lock()
 
     async def play_next(self):
-        async with self._play_lock:
+        async with self._lock:
             if not self.queue:
-                await self.stop_and_cleanup()
+                await self._grace_and_leave()
                 return
 
-            title, stream_url, thumbnail, page_url = self.queue.pop(0)
-            self.current_track = (title, stream_url, thumbnail, page_url)
+            title, stream_url, thumb, page, headers = self.queue.pop(0)
+            self.current = (title, stream_url, thumb, page, headers)
 
-            ffmpeg_options = {
-                "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-                "options": "-vn -bufsize 8192k"
-            }
-
+            ffmpeg_kwargs = build_ffmpeg_kwargs(headers)
             try:
-                base = discord.FFmpegPCMAudio(stream_url, **ffmpeg_options)
+                base = discord.FFmpegPCMAudio(stream_url, **ffmpeg_kwargs)
             except Exception as e:
                 logging.error("FFmpeg init error: %s", e)
-                # пробуем следующий трек
                 await self.play_next()
                 return
 
             source = discord.PCMVolumeTransformer(base, volume=self.volume)
             self.current_source = source
 
-            def after_playing(error):
-                if error:
-                    logging.error("Playback error: %s", error)
-                coro = self.play_next()
-                fut = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
-                try:
-                    fut.result()
-                except Exception as e:
-                    logging.error("after_playing future error: %s", e)
+            def _after(err: Optional[Exception]):
+                if err:
+                    logging.error("Playback error: %s", err)
+                fut = asyncio.run_coroutine_threadsafe(self.play_next(), self.bot.loop)
+                try: fut.result()
+                except Exception as e: logging.error("after future error: %s", e)
 
             try:
-                self.vc.play(source, after=after_playing)
+                if not self.vc or not self.vc.is_connected():
+                    logging.warning("VoiceClient disconnected before play.")
+                    return
+                self.vc.play(source, after=_after)
             except Exception as e:
                 logging.error("vc.play error: %s", e)
                 await self.play_next()
                 return
 
-            await self.update_control_message()
+            await self.update_panel()
 
-    async def stop_and_cleanup(self):
+    async def _grace_and_leave(self):
+        if self._leave_guard:
+            return
+        self._leave_guard = True
+        await asyncio.sleep(8)  # подождём — вдруг добавят трек
+        self._leave_guard = False
+
+        if self.queue or (self.vc and (self.vc.is_playing() or self.vc.is_paused())):
+            return
         try:
             if self.vc and self.vc.is_connected():
                 await self.vc.disconnect(force=True)
         except Exception:
             pass
-        if self.control_message:
-            try:
-                await self.control_message.edit(view=None)
-            except Exception:
-                pass
-            try:
-                await self.control_message.delete()
-            except Exception:
-                pass
-            self.control_message = None
-        self.current_track = None
+        self.current = None
         self.current_source = None
-        self.queue.clear()
+        self.control_message = None
 
-    async def update_control_message(self):
-        current_title = self.current_track[0] if self.current_track else "Нет трека"
-        current_thumbnail = self.current_track[2] if self.current_track else None
-        current_page_url = self.current_track[3] if self.current_track else None
+    async def update_panel(self):
+        title = self.current[0] if self.current else "Нет трека"
+        status = "▶️ Воспроизведение" if self.vc and self.vc.is_playing() else ("⏸ Пауза" if self.vc and self.vc.is_paused() else "❌ Не играет")
+        qtxt = "\n".join(f"{i+1}. {t[0]}" for i, t in enumerate(self.queue[:10])) or "Очередь пуста"
+        vol = int(self.volume * 100)
 
-        if self.current_source and self.vc.is_playing():
-            status = "▶️ Воспроизведение"
-        elif self.vc.is_paused():
-            status = "⏸ Пауза"
-        else:
-            status = "❌ Не играет"
-
-        queue_text = "\n".join([f"{i+1}. {t[0]}" for i, t in enumerate(self.queue[:10])]) or "Очередь пуста"
-
-        now_line = f"**Сейчас играет:** {current_title}"
-        if current_page_url:
-            now_line += f"\n🔗 {current_page_url}"
-
-        vol_pct = int(self.volume * 100)
-        embed = discord.Embed(
+        emb = discord.Embed(
             title=f"🎶 Музыкальный плеер — {status}",
-            description=f"{now_line}\n\n📃 Очередь ({len(self.queue)}):\n{queue_text}\n\n🔊 Громкость: **{vol_pct}%**",
-            color=discord.Color.green()
+            description=f"**Сейчас:** {title}\n\n📃 Очередь ({len(self.queue)}):\n{qtxt}\n\n🔊 Громкость: **{vol}%**",
+            color=discord.Color.green(),
         )
-        if current_thumbnail:
-            embed.set_thumbnail(url=current_thumbnail)
+        if self.current and self.current[2]:
+            emb.set_thumbnail(url=self.current[2])
 
         view = MusicControlView()
-
-        if self.control_message:
-            try:
-                await self.control_message.edit(embed=embed, view=view)
-                return
-            except Exception:
-                self.control_message = None
-
         try:
-            self.control_message = await self.text_channel.send(embed=embed, view=view)
+            # при каждом апдейте публикуем/обновлять старое сообщение не критично
+            self.control_message = await self.text_channel.send(embed=emb, view=view)
         except Exception as e:
-            logging.error("Не удалось отправить control_message: %s", e)
+            logging.debug("update_panel error: %s", e)
 
     # helpers
     def pause(self):
@@ -1064,295 +903,230 @@ class MusicPlayer:
         if self.vc and (self.vc.is_playing() or self.vc.is_paused()):
             self.vc.stop()
 
-
-# -------------------------------------------------------
-# VIEW (кнопки управления)
-# -------------------------------------------------------
-
+# ============================ VIEW (кнопки) ============================
 class MusicControlView(View):
-    """Persistent view: определяем по custom_id; guild берём из interaction.guild.id."""
     def __init__(self):
         super().__init__(timeout=None)
 
-    @staticmethod
-    def _get_player(interaction: Interaction) -> Optional[MusicPlayer]:
-        if not interaction.guild:
+    def _player(self, inter: Interaction) -> Optional[MusicPlayer]:
+        if not inter.guild:
             return None
-        return music_players.get(interaction.guild.id)
+        return players.get(inter.guild.id)
 
-    @discord.ui.button(label="⏯ Вкл/Пауза", style=ButtonStyle.primary, custom_id="mp_toggle")
-    async def pause_resume(self, interaction: Interaction, _: Button):
-        player = self._get_player(interaction)
-        if not player or not player.vc or not player.vc.is_connected():
-            await interaction.response.send_message("❌ Бот не подключен.", ephemeral=True)
-            return
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False, ephemeral=True)
+    @discord.ui.button(label="⏯ Пауза/Продолжить", style=ButtonStyle.primary)
+    async def toggle(self, inter: Interaction, _: Button):
+        pl = self._player(inter)
+        if not pl or not pl.vc or not pl.vc.is_connected():
+            return await inter.response.send_message("❌ Бот не подключен.", ephemeral=True)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        if pl.vc.is_paused(): pl.resume()
+        elif pl.vc.is_playing(): pl.pause()
+        await pl.update_panel()
 
-        if player.vc.is_paused():
-            player.resume()
-        elif player.vc.is_playing():
-            player.pause()
-        await player.update_control_message()
+    @discord.ui.button(label="⏭ Пропустить", style=ButtonStyle.secondary)
+    async def skip(self, inter: Interaction, _: Button):
+        pl = self._player(inter)
+        if not pl:
+            return await inter.response.send_message("❌ Не играет.", ephemeral=True)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        pl.stop()
+        await pl.update_panel()
 
-    @discord.ui.button(label="⏭ Пропустить", style=ButtonStyle.secondary, custom_id="mp_skip")
-    async def skip(self, interaction: Interaction, _: Button):
-        player = self._get_player(interaction)
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False, ephemeral=True)
-        if player:
-            player.stop()
-            await player.update_control_message()
+    @discord.ui.button(label="🔉 Тише", style=ButtonStyle.secondary)
+    async def vol_down(self, inter: Interaction, _: Button):
+        pl = self._player(inter)
+        if not pl:
+            return await inter.response.send_message("❌ Не играет.", ephemeral=True)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        pl.volume = max(0.0, round(pl.volume - 0.1, 2))
+        if pl.current_source and isinstance(pl.current_source, discord.PCMVolumeTransformer):
+            pl.current_source.volume = pl.volume
+        await pl.update_panel()
 
-    @discord.ui.button(label="🔉 Тише", style=ButtonStyle.secondary, custom_id="mp_quieter")
-    async def volume_down(self, interaction: Interaction, _: Button):
-        player = self._get_player(interaction)
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False, ephemeral=True)
-        if player:
-            player.volume = max(0.0, round(player.volume - 0.1, 2))
-            if player.current_source:
-                player.current_source.volume = player.volume
-            await player.update_control_message()
+    @discord.ui.button(label="🔊 Громче", style=ButtonStyle.secondary)
+    async def vol_up(self, inter: Interaction, _: Button):
+        pl = self._player(inter)
+        if not pl:
+            return await inter.response.send_message("❌ Не играет.", ephemeral=True)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        pl.volume = min(2.0, round(pl.volume + 0.1, 2))
+        if pl.current_source and isinstance(pl.current_source, discord.PCMVolumeTransformer):
+            pl.current_source.volume = pl.volume
+        await pl.update_panel()
 
-    @discord.ui.button(label="🔊 Громче", style=ButtonStyle.secondary, custom_id="mp_louder")
-    async def volume_up(self, interaction: Interaction, _: Button):
-        player = self._get_player(interaction)
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False, ephemeral=True)
-        if player:
-            player.volume = min(2.0, round(player.volume + 0.1, 2))
-            if player.current_source:
-                player.current_source.volume = player.volume
-            await player.update_control_message()
+    @discord.ui.button(label="🛑 Стоп", style=ButtonStyle.danger)
+    async def stop(self, inter: Interaction, _: Button):
+        pl = self._player(inter)
+        if not pl:
+            return await inter.response.send_message("Уже остановлено.", ephemeral=True)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        pl.stop()
+        await pl._grace_and_leave()
+        players.pop(inter.guild.id, None)
+        await inter.followup.send("🛑 Остановлено.", ephemeral=True)
 
-    @discord.ui.button(label="🛑 Стоп", style=ButtonStyle.danger, custom_id="mp_stop")
-    async def hard_stop(self, interaction: Interaction, _: Button):
-        player = self._get_player(interaction)
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False, ephemeral=True)
-        if player:
-            player.stop()
-            await player.stop_and_cleanup()
-            music_players.pop(interaction.guild.id, None)
+# ============================ DISCORD-БОТ ============================
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+players: Dict[int, MusicPlayer] = {}
 
-
-# -------------------------------------------------------
-# СЛЭШ-КОМАНДЫ
-# -------------------------------------------------------
-# Ниже предполагается, что у тебя есть объекты `bot` и `tree` (discord.Client / commands.Bot && app_commands.CommandTree)
-
+# ---------- /play ----------
 @tree.command(name="play", description="Воспроизвести музыку")
 @app_commands.describe(query="Название трека или ссылка")
-async def play(interaction: Interaction, query: str):
-    # деферим один раз
-    if not interaction.response.is_done():
+async def play_cmd(inter: Interaction, query: str):
+    if not inter.response.is_done():
         try:
-            await interaction.response.defer(thinking=False)
+            await inter.response.defer(thinking=False)
         except discord.NotFound:
             return
 
-    user = interaction.user
-    if not user.voice or not user.voice.channel:
-        await interaction.followup.send("❌ Сначала зайди в голосовой канал!", ephemeral=True)
-        return
+    if not inter.user or not getattr(inter.user, "voice", None) or not inter.user.voice.channel:
+        return await inter.followup.send("❌ Сначала зайди в голосовой канал.", ephemeral=True)
 
-    voice_channel = user.voice.channel
-    guild = interaction.guild
-    guild_id = guild.id
+    ch = inter.user.voice.channel
+    guild = inter.guild
 
     vc = discord.utils.get(bot.voice_clients, guild=guild)
     if not vc:
-        vc = await voice_channel.connect()
-    elif vc.channel != voice_channel:
-        await vc.move_to(voice_channel)
+        vc = await ch.connect(self_deaf=False)
+    elif vc.channel != ch:
+        await vc.move_to(ch)
 
-    # ждём коннект
-    for _ in range(50):
-        if vc.is_connected():
-            break
+    # ждём до коннекта
+    for _ in range(40):
+        if vc.is_connected(): break
         await asyncio.sleep(0.1)
     if not vc.is_connected():
-        await interaction.followup.send("❌ Не удалось подключиться к голосовому каналу.", ephemeral=True)
-        return
+        return await inter.followup.send("❌ Не удалось подключиться к голосовому.", ephemeral=True)
 
-    player = music_players.get(guild_id)
-    if not player:
-        player = MusicPlayer(guild, vc, interaction.channel, bot)
-        music_players[guild_id] = player
-    else:
-        player.vc = vc
-        player.text_channel = interaction.channel
-
-    # --- НАДЁЖНЫЙ ПОИСК ТРЕКА ---
-    base_opts = YTDLP_BASE_OPTS
-
+    # yt-dlp: резолвим
     info = None
-    # 1) если URL — пробуем как есть
-    if _is_url(query):
-        info = await extract_info_async(query, base_opts | {"default_search": "auto"}, timeout=10.0)
+    if is_url(query):
+        info = await ytdlp_extract(query, {"default_search": "auto"}, timeout=14.0)
     else:
-        # 2) сначала точный single-result поиск
-        info = await extract_info_async(f"ytsearch1:{query}", base_opts | {"default_search": "ytsearch"}, timeout=7.0)
-        # 3) если вдруг не нашли — fallback на обычный поиск
-        if not info:
-            info = await extract_info_async(query, base_opts | {"default_search": "ytsearch"}, timeout=10.0)
+        info = await ytdlp_extract(f"ytsearch1:{query}", timeout=10.0) or await ytdlp_extract(query, timeout=12.0)
 
-    # нормализуем результат
     if info and "entries" in info:
-        entries = info.get("entries") or []
-        info = entries[0] if entries else None
+        ent = (info.get("entries") or [])
+        info = ent[0] if ent else None
 
     if not info:
-        await interaction.followup.send("❌ Не удалось найти трек по этому запросу.", ephemeral=True)
-        return
+        return await inter.followup.send("❌ Не удалось найти трек.", ephemeral=True)
 
-    stream_url = info.get("url")
-    title = info.get("title") or "Неизвестно"
-    thumbnail = info.get("thumbnail")
-    page_url = info.get("webpage_url") or (query if _is_url(query) else None)
+    stream = info.get("url")
+    title = info.get("title") or "Без названия"
+    thumb = info.get("thumbnail")
+    page = info.get("webpage_url") or (query if is_url(query) else None)
 
-    if not stream_url:
-        # на редких ответах flat-режима бывает пустой url — пробуем ещё раз по page_url
-        if page_url and page_url != query:
-            info2 = await extract_info_async(page_url, base_opts | {"default_search": "auto"}, timeout=10.0)
-            if info2 and "entries" in info2:
-                ents = info2.get("entries") or []
-                info2 = ents[0] if ents else None
-            if info2:
-                stream_url = info2.get("url")
-                thumbnail = thumbnail or info2.get("thumbnail")
-                title = title or info2.get("title")
-        if not stream_url:
-            await interaction.followup.send("❌ Не удалось получить аудиопоток для этого трека.", ephemeral=True)
-            return
+    if not stream and page:
+        info2 = await ytdlp_extract(page, {"default_search": "auto"}, timeout=14.0)
+        if info2 and "entries" in info2:
+            ents = info2.get("entries") or []
+            info2 = ents[0] if ents else None
+        if info2:
+            stream = info2.get("url")
+            thumb = thumb or info2.get("thumbnail")
+            title = title or info2.get("title")
 
-    track = (title, stream_url, thumbnail, page_url)
-    player.queue.append(track)
+    if not stream:
+        return await inter.followup.send("❌ Не удалось получить поток для этого трека.", ephemeral=True)
+
+    http_headers = info.get("http_headers") or {}
+    http_headers.setdefault("User-Agent", http_headers.get("User-Agent", DEFAULT_UA))
+
+    pl = players.get(guild.id)
+    if not pl:
+        pl = MusicPlayer(guild, vc, inter.channel, bot)  # type: ignore
+        players[guild.id] = pl
+    else:
+        pl.vc = vc
+        pl.text_channel = inter.channel  # type: ignore
+
+    pl.queue.append((title, stream, thumb, page, http_headers))
 
     if not vc.is_playing() and not vc.is_paused():
-        await player.play_next()
+        await pl.play_next()
     else:
-        await player.update_control_message()
-        try:
-            msg = await interaction.followup.send(f"➕ **{title}** добавлен в очередь.", ephemeral=False)
-            await asyncio.sleep(3)
-            await msg.delete()
-        except Exception:
-            pass
+        await pl.update_panel()
+        await inter.followup.send(f"➕ **{title}** добавлен в очередь.", ephemeral=True)
 
-
-# — АВТОДОПОЛНЕНИЕ ДЛЯ /play —
-@play.autocomplete("query")
-async def play_autocomplete(interaction: Interaction, current: str):
-    # Ловим исключения и всегда возвращаем список Choice
+# автодополнение для /play
+@play_cmd.autocomplete("query")
+async def _play_ac(inter: Interaction, current: str):
     try:
         return await smart_autocomplete(current)
     except Exception:
-        # На всякий — без ошибок в логике слэша
         return []
 
-
+# ---------- /queue ----------
 @tree.command(name="queue", description="Показать очередь")
-@app_commands.describe(page="Номер страницы очереди")
-async def queue_cmd(interaction: Interaction, page: Optional[int] = 1):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    player = music_players.get(interaction.guild.id)
-    if not player or (not player.queue and not player.current_track):
-        await interaction.followup.send("Очередь пуста.", ephemeral=True)
-        return
+async def queue_cmd(inter: Interaction):
+    pl = players.get(inter.guild_id)
+    if not pl or (not pl.queue and not pl.current):
+        return await inter.response.send_message("Очередь пуста.", ephemeral=True)
 
-    page = max(1, page or 1)
-    per_page = 20
-    start = (page - 1) * per_page
-    end = start + per_page
+    lines: List[str] = []
+    if pl.current:
+        lines.append(f"**Сейчас:** {pl.current[0]}")
+    for i, t in enumerate(pl.queue[:20], 1):
+        lines.append(f"{i}. {t[0]}")
+    await inter.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
-    lines = []
-    if player.current_track:
-        lines.append(f"**Сейчас:** {player.current_track[0]}")
-    if player.queue:
-        for i, t in enumerate(player.queue[start:end], start=start + 1):
-            lines.append(f"{i}. {t[0]}")
-    text = "\n".join(lines) or "Очередь пуста."
-    total_pages = max(1, (len(player.queue) + per_page - 1) // per_page)
-    suffix = f"\n\nСтр. {page}/{total_pages}"
-    await interaction.followup.send((text + suffix)[:1900], ephemeral=True)
-
-
+# ---------- /skip ----------
 @tree.command(name="skip", description="Пропустить текущий трек")
-async def skip_cmd(interaction: Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    player = music_players.get(interaction.guild.id)
-    if not player or not player.vc:
-        await interaction.followup.send("❌ Не играет.", ephemeral=True)
-        return
-    player.stop()
-    await player.update_control_message()
-    await interaction.followup.send("⏭ Пропущено.", ephemeral=True)
+async def skip_cmd(inter: Interaction):
+    pl = players.get(inter.guild_id)
+    if not pl or not pl.vc:
+        return await inter.response.send_message("❌ Не играет.", ephemeral=True)
+    pl.stop()
+    await pl.update_panel()
+    await inter.response.send_message("⏭ Пропущено.", ephemeral=True)
 
-
+# ---------- /pause ----------
 @tree.command(name="pause", description="Пауза/Продолжить")
-async def pause_cmd(interaction: Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    player = music_players.get(interaction.guild.id)
-    if not player or not player.vc:
-        await interaction.followup.send("❌ Не играет.", ephemeral=True)
-        return
-    if player.vc.is_paused():
-        player.resume()
-        msg = "▶️ Продолжаю."
-    elif player.vc.is_playing():
-        player.pause()
-        msg = "⏸ Пауза."
+async def pause_cmd(inter: Interaction):
+    pl = players.get(inter.guild_id)
+    if not pl or not pl.vc:
+        return await inter.response.send_message("❌ Не играет.", ephemeral=True)
+    if pl.vc.is_paused():
+        pl.resume(); msg = "▶️ Продолжаю."
+    elif pl.vc.is_playing():
+        pl.pause(); msg = "⏸ Пауза."
     else:
         msg = "❌ Не играет."
-    await player.update_control_message()
-    await interaction.followup.send(msg, ephemeral=True)
+    await inter.response.send_message(msg, ephemeral=True)
 
-
+# ---------- /remove ----------
 @tree.command(name="remove", description="Удалить трек из очереди по номеру (см. /queue)")
 @app_commands.describe(index="Номер трека в очереди (как показывает /queue)")
-async def remove_cmd(interaction: Interaction, index: int):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    player = music_players.get(interaction.guild.id)
-    if not player or not player.queue:
-        await interaction.followup.send("Очередь пуста.", ephemeral=True)
-        return
-    if index < 1 or index > len(player.queue):
-        await interaction.followup.send("Неверный номер.", ephemeral=True)
-        return
-    title = player.queue.pop(index - 1)[0]
-    await player.update_control_message()
-    await interaction.followup.send(f"🗑 Удалён: **{title}**", ephemeral=True)
+async def remove_cmd(inter: Interaction, index: int):
+    pl = players.get(inter.guild_id)
+    if not pl or not pl.queue:
+        return await inter.response.send_message("Очередь пуста.", ephemeral=True)
+    if index < 1 or index > len(pl.queue):
+        return await inter.response.send_message("Неверный номер.", ephemeral=True)
+    title = pl.queue.pop(index - 1)[0]
+    await pl.update_panel()
+    await inter.response.send_message(f"🗑 Удалён: **{title}**", ephemeral=True)
+
+# ---------- /stop ----------
+@tree.command(name="stop", description="Остановить и выйти")
+async def stop_cmd(inter: Interaction):
+    pl = players.get(inter.guild_id)
+    if not pl:
+        return await inter.response.send_message("Уже остановлено.", ephemeral=True)
+    pl.stop()
+    await pl._grace_and_leave()
+    players.pop(inter.guild_id, None)
+    await inter.response.send_message("🛑 Остановлено.", ephemeral=True)
 
 
-@tree.command(name="stop", description="Остановить и очистить очередь")
-async def stop_cmd(interaction: Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    player = music_players.get(interaction.guild.id)
-    if not player:
-        await interaction.followup.send("Уже остановлено.", ephemeral=True)
-        return
-    try:
-        player.stop()
-        await player.stop_and_cleanup()
-    finally:
-        music_players.pop(interaction.guild.id, None)
-    await interaction.followup.send("🛑 Остановлено и очищено.", ephemeral=True)
-
-# --- /say ---
-class SayModal(discord.ui.Modal, title="Форма заполнения"):
-    message = discord.ui.TextInput(label="Текст сообщения", required=True)
-    image_url = discord.ui.TextInput(label="Ссылка на изображение (опционально)", required=False)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        if self.image_url.value.strip():
-            embed = discord.Embed(description=self.message.value)
-            embed.set_image(url=self.image_url.value)
-            await interaction.channel.send(embed=embed)
-        else:
-            await interaction.channel.send(self.message.value)
 
 # Команда /say теперь только для админов
 @bot.tree.command(name="say", description="Написать сообщение от бота")
@@ -2301,19 +2075,36 @@ async def clear_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ У вас нет доступа к этой команде.", ephemeral=True)
 
 
+# -------------- STARTUP & PERSISTENT VIEW --------------
 @bot.event
 async def on_ready():
     logging.info("✅ Бот %s запущен!", bot.user)
-    activity = discord.Game(name="играет пальчиком в очке Дойза | /help ❤")
+    activity = discord.Game(name="  |  /help ❤")
     await bot.change_presence(status=discord.Status.online, activity=activity)
-
     try:
-        synced = await bot.tree.sync()
-        logging.info("🔄 Синхронизировано %d глобальных команд", len(synced))
+        # регистрируем persistent view по custom_id (без привязки к guild_id)
+        bot.add_view(MusicControlView())
+    except Exception as e:
+        logging.error("add_view error: %s", e)
+
+    # синхронизация команд
+    try:
+        synced = await tree.sync()
+        names = ", ".join(sorted([c.name for c in synced]))
+        logging.info("🔄 Синхронизировано %d глобальных команд: %s", len(synced), names)
     except Exception as e:
         logging.error("Ошибка sync: %s", e)
 
-# ← сюда вставь НОВЫЙ бот-токен из Discord Developer Portal
-TOKEN = "MTMzOTQ4OTA4NTk3MDE4NjMxMg.GkuFvo.V4UaQADXE4pjm9_HSoPlP2fsEeLF7p099-IV0E"
 
-bot.run(TOKEN)
+# -------------- RUN --------------
+if __name__ == "__main__":
+    import os
+
+    # Читаем из переменной окружения DISCORD_TOKEN
+    TOKEN = os.getenv("DISCORD_TOKEN")
+
+    if not TOKEN:
+        # fallback — можно вставить прямо в код, если не хочешь через env
+        TOKEN = ""
+
+    bot.run(TOKEN)
